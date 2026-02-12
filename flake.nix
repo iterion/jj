@@ -60,12 +60,23 @@
           rustc = platform;
           cargo = platform;
         };
+
+      # Keep a stable, lightweight toolchain handy for quick local iteration.
+      rustQuickToolchain = pkgs.rust-bin.stable.latest.default;
+      rustQuickPlatform = pkgs.makeRustPlatform {
+        rustc = rustQuickToolchain;
+        cargo = rustQuickToolchain;
+      };
     in {
       formatter = pkgs.alejandra;
 
       packages = {
         jujutsu = pkgs.callPackage ./default.nix {
           rustPlatform = rustMinimalPlatform;
+          gitRev = self.rev or self.dirtyRev or null;
+        };
+        jujutsu-quick = pkgs.callPackage ./default.nix {
+          rustPlatform = rustQuickPlatform;
           gitRev = self.rev or self.dirtyRev or null;
         };
         default = self.packages.${system}.jujutsu;
@@ -145,6 +156,20 @@
           name = "jujutsu";
           packages = packages ++ jujutsu.nativeBuildInputs ++ jujutsu.buildInputs;
           inherit shellHook;
+        };
+
+      devShells.quick = let
+        jujutsu = self.packages.${system}.jujutsu-quick;
+      in
+        pkgs.mkShell {
+          name = "jujutsu-quick";
+          packages =
+            (with pkgs; [
+              rustQuickToolchain
+              git
+            ])
+            ++ jujutsu.nativeBuildInputs
+            ++ jujutsu.buildInputs;
         };
     }));
 }
