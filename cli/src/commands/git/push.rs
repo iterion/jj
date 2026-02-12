@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future;
 use std::io;
 use std::io::Write as _;
 use std::iter;
+use std::process::Command;
 use std::sync::Arc;
 
 use clap::ArgGroup;
@@ -29,6 +31,7 @@ use futures::future::try_join_all;
 use indexmap::IndexSet;
 use itertools::Itertools as _;
 use jj_lib::backend::CommitId;
+use jj_lib::backend::TreeValue;
 use jj_lib::commit::Commit;
 use jj_lib::config::ConfigGetResultExt as _;
 use jj_lib::git;
@@ -37,6 +40,7 @@ use jj_lib::git::GitPushRefTargets;
 use jj_lib::git::GitSettings;
 use jj_lib::index::IndexResult;
 use jj_lib::merge::Diff;
+use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::RefTarget;
 use jj_lib::operation::Operation;
 use jj_lib::ref_name::RefName;
@@ -104,6 +108,13 @@ use crate::ui::Ui;
 /// Unlike in Git, the remote to push to is not derived from the tracked remote
 /// bookmarks. Use `--remote` to select the remote Git repository by name. There
 /// is no option to push to multiple remotes.
+///
+/// In a colocated Git-backed workspace, changed submodule branches are pushed
+/// to their own upstreams before the superproject reference is pushed. A
+/// submodule push failure stops the superproject push. Detached submodule HEADs
+/// are resolved through a local branch with an upstream at the recorded
+/// gitlink; commits already reachable from a known remote ref need no separate
+/// push.
 ///
 /// Before the command actually moves, creates, or deletes a remote bookmark, it
 /// makes several [safety checks]. If there is a problem, you may need to run
@@ -555,6 +566,8 @@ pub async fn cmd_git_push(
     }
 
     let git_settings = GitSettings::from_settings(tx.settings())?;
+    push_changed_git_submodules(ui, tx.base_workspace_helper(), &ref_updates, &git_settings)
+        .await?;
     let options = GitPushOptions {
         remote_push_options: args.option.clone(),
     };
@@ -598,6 +611,207 @@ pub async fn cmd_git_push(
         Ok(())
     } else {
         Err(user_error("Failed to push some bookmarks"))
+    }
+}
+
+async fn push_changed_git_submodules(
+    ui: &Ui,
+    workspace_command: &WorkspaceCommandHelper,
+    ref_updates: &GitPushRefTargets,
+    git_settings: &GitSettings,
+) -> Result<(), CommandError> {
+    if !workspace_command.working_copy_shared_with_git() {
+        return Ok(());
+    }
+    let repo = workspace_command.repo();
+    let mut changed_submodules = BTreeMap::new();
+    let updates = ref_updates
+        .bookmarks
+        .iter()
+        .chain(&ref_updates.tags)
+        .map(|(_, update)| update);
+    for update in updates {
+        let Some(commit_id) = &update.after else {
+            continue;
+        };
+        let commit = repo.store().get_commit_async(commit_id).await?;
+        let old_tree = if let Some(old_commit_id) = &update.before {
+            repo.store().get_commit_async(old_commit_id).await?.tree()
+        } else {
+            repo.store().empty_merged_tree()
+        };
+        for (path, value) in commit.tree().entries() {
+            let value = value?;
+            let Some(TreeValue::GitSubmodule(expected_head)) = value.as_normal() else {
+                continue;
+            };
+            if matches!(
+                old_tree.path_value(&path).await?.into_resolved(),
+                Ok(Some(TreeValue::GitSubmodule(old_head))) if old_head == *expected_head
+            ) {
+                continue;
+            }
+            let expected_heads = changed_submodules.entry(path).or_insert_with(Vec::new);
+            if !expected_heads.contains(expected_head) {
+                expected_heads.push(expected_head.clone());
+            }
+        }
+    }
+    for (path, expected_heads) in changed_submodules {
+        let formatted_path = workspace_command.format_file_path(&path);
+        let submodule_path = path
+            .to_fs_path(workspace_command.workspace_root())
+            .map_err(|err| user_error_with_message("Invalid Git submodule path", err))?;
+        let Ok(submodule_repo) = gix::open(&submodule_path) else {
+            continue;
+        };
+        let Ok(head) = submodule_repo.head() else {
+            continue;
+        };
+        let Ok(head_id) = submodule_repo.head_id() else {
+            continue;
+        };
+        let Some(expected_head) = expected_heads
+            .iter()
+            .find(|expected_head| head_id.as_bytes() == expected_head.as_bytes())
+        else {
+            continue;
+        };
+
+        let explicit_push_target = if head.is_detached() {
+            let Some(target) = find_detached_submodule_push_target(
+                &git_settings.executable_path,
+                &submodule_path,
+                expected_head,
+                &formatted_path,
+            )?
+            else {
+                continue;
+            };
+            Some(target)
+        } else {
+            None
+        };
+
+        let mut command = Command::new(&git_settings.executable_path);
+        command
+            .current_dir(&submodule_path)
+            .args(["-c", "core.fsmonitor=false"])
+            .args(["-c", "submodule.recurse=false"])
+            .args(["push", "--recurse-submodules=on-demand"]);
+        if let Some((remote, branch)) = &explicit_push_target {
+            command.args(["--", remote, branch]);
+        }
+        let output = command.output().map_err(|err| {
+            user_error_with_message(
+                format!("Failed to execute Git while pushing submodule {formatted_path}"),
+                err,
+            )
+        })?;
+        check_git_submodule_push_output(ui, output, &formatted_path)?;
+    }
+
+    Ok(())
+}
+
+fn check_git_submodule_push_output(
+    ui: &Ui,
+    output: std::process::Output,
+    formatted_path: &str,
+) -> Result<(), CommandError> {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        let message = if detail.is_empty() {
+            format!("Failed to push Git submodule {formatted_path}")
+        } else {
+            format!("Failed to push Git submodule {formatted_path}: {detail}")
+        };
+        return Err(user_error(message));
+    }
+    writeln!(ui.status(), "Pushed Git submodule {formatted_path}.")?;
+    Ok(())
+}
+
+fn find_detached_submodule_push_target(
+    git_executable: &std::path::Path,
+    submodule_path: &std::path::Path,
+    expected_head: &CommitId,
+    formatted_path: &str,
+) -> Result<Option<(String, String)>, CommandError> {
+    let output = Command::new(git_executable)
+        .current_dir(submodule_path)
+        .args(["-c", "core.fsmonitor=false"])
+        .args([
+            "for-each-ref",
+            "--format=%(refname:short)%09%(upstream:remotename)",
+            &format!("--points-at={}", expected_head.hex()),
+            "refs/heads",
+        ])
+        .output()
+        .map_err(|err| {
+            user_error_with_message(
+                format!("Failed to inspect branches for Git submodule {formatted_path}"),
+                err,
+            )
+        })?;
+    if !output.status.success() {
+        return Err(user_error(format!(
+            "Failed to inspect branches for Git submodule {formatted_path}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    let push_targets: Vec<_> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (branch, remote) = line.split_once('\t')?;
+            (!branch.is_empty() && !remote.is_empty())
+                .then(|| (remote.to_owned(), branch.to_owned()))
+        })
+        .collect();
+    match push_targets.as_slice() {
+        [] => {
+            let output = Command::new(git_executable)
+                .current_dir(submodule_path)
+                .args(["-c", "core.fsmonitor=false"])
+                .args([
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    &format!("--contains={}", expected_head.hex()),
+                    "refs/remotes",
+                    "refs/tags",
+                ])
+                .output()
+                .map_err(|err| {
+                    user_error_with_message(
+                        format!("Failed to inspect remote refs for Git submodule {formatted_path}"),
+                        err,
+                    )
+                })?;
+            if !output.status.success() {
+                return Err(user_error(format!(
+                    "Failed to inspect remote refs for Git submodule {formatted_path}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            if output.stdout.is_empty() {
+                Err(user_error(format!(
+                    "Git submodule {formatted_path} is detached at commit {}, which is not \
+                     reachable from a known remote ref; check out a branch with an upstream \
+                     before pushing",
+                    expected_head.hex()
+                )))
+            } else {
+                Ok(None)
+            }
+        }
+        [target] => Ok(Some(target.clone())),
+        _ => Err(user_error(format!(
+            "Git submodule {formatted_path} has multiple branches with upstreams at commit {}; \
+             check out the branch to push",
+            expected_head.hex()
+        ))),
     }
 }
 

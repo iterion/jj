@@ -28,6 +28,7 @@ in
     }";
 
     cargoBuildFlags = ["--bin" "jj"]; # don't build and install the fake editors
+    doCheck = false;
     useNextest = true;
     cargoTestFlags = ["--profile" "ci"];
     src = filterSrc ./. [

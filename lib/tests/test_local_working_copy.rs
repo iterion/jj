@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::fs::File;
 use std::io;
@@ -1893,7 +1894,7 @@ fn test_git_submodule(gitignore_content: &str) -> TestResult {
     let submodule_id2 = write_random_commit(tx.repo_mut()).id().clone();
     tree_builder.set_or_remove(
         submodule_path.to_owned(),
-        Merge::normal(TreeValue::GitSubmodule(submodule_id2)),
+        Merge::normal(TreeValue::GitSubmodule(submodule_id2.clone())),
     );
     let tree_id2 = tree_builder.write_tree().block_on()?;
     let commit2 = commit_with_tree(repo.store(), tree_id2.clone());
@@ -1929,6 +1930,16 @@ fn test_git_submodule(gitignore_content: &str) -> TestResult {
     // when we snapshot
     let (new_tree, _stats) = test_workspace.snapshot_with_options(&snapshot_options)?;
     assert_tree_eq!(new_tree, tree_id1);
+
+    // A higher-level nested-workspace coordinator can override Git HEAD with
+    // the commit representing that submodule's Jujutsu working set.
+    let submodule_ids = BTreeMap::from([(submodule_path.to_owned(), submodule_id2.clone())]);
+    let nested_snapshot_options = SnapshotOptions {
+        git_submodule_ids: Some(&submodule_ids),
+        ..snapshot_options.clone()
+    };
+    let (new_tree, _stats) = test_workspace.snapshot_with_options(&nested_snapshot_options)?;
+    assert_tree_eq!(new_tree, tree_id2);
 
     // Check that the files in the submodule are not deleted
     let file_in_submodule_path = added_submodule_path.to_fs_path_unchecked(&workspace_root);

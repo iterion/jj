@@ -1262,6 +1262,76 @@ where
     SnapshotWorkingCopyError::Command(err.into())
 }
 
+/// Snapshots initialized nested Jujutsu workspaces and returns the commit IDs
+/// their superproject gitlinks should record.
+///
+/// A normal colocated workspace keeps Git HEAD at the parent of `@`. For a
+/// submodule, however, the superproject needs to point at `@` while it contains
+/// working-copy changes. An empty one-parent `@` collapses back to its parent,
+/// which avoids making every freshly initialized submodule look modified.
+#[cfg(feature = "git")]
+fn snapshot_nested_working_copy_ids(
+    workspace_root: &Path,
+    tree: &MergedTree,
+) -> Result<BTreeMap<RepoPathBuf, CommitId>, CommandError> {
+    let jj_executable = std::env::current_exe()
+        .map_err(|err| internal_error_with_message("Could not find the jj executable", err))?;
+    let mut ids = BTreeMap::new();
+    for (path, value) in tree.entries() {
+        let value = value
+            .map_err(|err| internal_error_with_message("Failed to inspect Git submodules", err))?;
+        if !matches!(value.as_normal(), Some(TreeValue::GitSubmodule(_))) {
+            continue;
+        }
+        let disk_path = path
+            .to_fs_path(workspace_root)
+            .map_err(|err| user_error_with_message("Invalid Git submodule path", err))?;
+        if !disk_path.join(".jj").is_dir() {
+            continue;
+        }
+
+        let output = std::process::Command::new(&jj_executable)
+            .current_dir(&disk_path)
+            .args(["--quiet", "--repository"])
+            .arg(&disk_path)
+            .args([
+                "log",
+                "--no-graph",
+                "-r",
+                "@",
+                "-T",
+                "if(empty && parents.len() == 1, parents.first().commit_id(), commit_id)",
+            ])
+            .output()
+            .map_err(|err| {
+                user_error_with_message(
+                    format!(
+                        "Failed to snapshot nested Jujutsu workspace {}",
+                        path.as_internal_file_string()
+                    ),
+                    err,
+                )
+            })?;
+        if !output.status.success() {
+            let details = String::from_utf8_lossy(&output.stderr);
+            return Err(user_error(format!(
+                "Could not snapshot nested Jujutsu workspace {}: {}",
+                path.as_internal_file_string(),
+                details.trim()
+            )));
+        }
+        let output_id = String::from_utf8_lossy(&output.stdout);
+        let id = CommitId::try_from_hex(output_id.trim()).ok_or_else(|| {
+            user_error(format!(
+                "Nested Jujutsu workspace {} returned an invalid commit ID",
+                path.as_internal_file_string()
+            ))
+        })?;
+        ids.insert(path, id);
+    }
+    Ok(ids)
+}
+
 impl WorkspaceCommandHelper {
     #[instrument(skip_all)]
     fn new(
@@ -1654,6 +1724,7 @@ to the current parents may contain changes from multiple commits.
             start_tracking_matcher,
             force_tracking_matcher: &NothingMatcher,
             max_new_file_size,
+            git_submodule_ids: None,
         })
     }
 
@@ -2089,6 +2160,10 @@ to the current parents may contain changes from multiple commits.
         git_import_export_lock: &GitImportExportLock,
     ) -> Result<SnapshotStats, SnapshotWorkingCopyError> {
         let workspace_name = self.workspace_name().to_owned();
+        #[cfg(feature = "git")]
+        let workspace_root = self.workspace_root().to_owned();
+        #[cfg(feature = "git")]
+        let working_copy_shared_with_git = self.env.working_copy_shared_with_git;
         let repo = self.repo().clone();
         let auto_tracking_matcher = self
             .auto_tracking_matcher(ui)
@@ -2113,8 +2188,19 @@ to the current parents may contain changes from multiple commits.
         };
 
         self.user_repo = ReadonlyUserRepo::new(repo);
+        #[cfg(feature = "git")]
+        let git_submodule_ids = if working_copy_shared_with_git {
+            snapshot_nested_working_copy_ids(&workspace_root, &wc_commit.tree())
+                .map_err(snapshot_command_error)?
+        } else {
+            BTreeMap::new()
+        };
         let (new_tree, stats) = {
             let mut options = options;
+            #[cfg(feature = "git")]
+            {
+                options.git_submodule_ids = Some(&git_submodule_ids);
+            }
             let progress = crate::progress::snapshot_progress(ui);
             options.progress = progress.as_ref().map(|x| x as _);
             locked_ws
@@ -3441,34 +3527,202 @@ async fn maybe_update_submodules_in_colocated_git_workspace(
     }
 
     let git_executable: PathBuf = settings.get("git.executable-path")?;
+    // An initialized nested Jujutsu workspace may intentionally be dirty
+    // relative to Git HEAD: its effective `@` was captured by the old outer
+    // gitlink. It is safe to replace that worktree while moving to another
+    // outer commit. Do this only for `.jj` workspaces; ordinary Git dirt must
+    // retain Git's usual refusal to overwrite local changes.
+    #[cfg(feature = "git")]
+    {
+        let mut visited = BTreeSet::new();
+        for (path, value) in new_commit.tree().entries() {
+            let value = value.map_err(|err| {
+                internal_error_with_message("Failed to inspect Git submodules", err)
+            })?;
+            let Some(TreeValue::GitSubmodule(id)) = value.as_normal() else {
+                continue;
+            };
+            let disk_path = path
+                .to_fs_path(workspace_root)
+                .map_err(|err| user_error_with_message("Invalid Git submodule path", err))?;
+            if disk_path.join(".jj").is_dir()
+                && disk_path.join(".git").exists()
+                && !force_checkout_nested_jj_workspace(
+                    ui,
+                    &git_executable,
+                    workspace_root,
+                    &disk_path,
+                    id,
+                    &mut visited,
+                )?
+            {
+                return Ok(());
+            }
+        }
+    }
+
     let output = std::process::Command::new(&git_executable)
         .current_dir(workspace_root)
         .args(["submodule", "update", "--init", "--recursive"])
         .output()
         .map_err(|err| {
             user_error_with_message(
-                "Failed to execute git submodule update while syncing the working copy",
+                "Failed to execute Git submodule update while syncing the working copy",
                 err,
             )
         })?;
 
     if output.status.success() {
+        // In a colocated workspace, the Git index represents the parent of the
+        // Jujutsu working-copy commit. `git submodule update` therefore
+        // initializes the right repositories, but can select the parent's
+        // gitlinks. Finish by checking out the IDs from the actual Jujutsu
+        // working-copy tree, then update any submodules nested below them.
+        for (path, value) in new_commit.tree().entries() {
+            let value = value.map_err(|err| {
+                internal_error_with_message("Failed to inspect Git submodules", err)
+            })?;
+            let Some(TreeValue::GitSubmodule(id)) = value.as_normal() else {
+                continue;
+            };
+            let disk_path = path
+                .to_fs_path(workspace_root)
+                .map_err(|err| user_error_with_message("Invalid Git submodule path", err))?;
+            let checkout_output = std::process::Command::new(&git_executable)
+                .current_dir(&disk_path)
+                .args(["checkout", "--detach", &id.hex()])
+                .output()
+                .map_err(|err| {
+                    user_error_with_message(
+                        format!(
+                            "Failed to execute Git while updating submodule {}",
+                            path.as_internal_file_string()
+                        ),
+                        err,
+                    )
+                })?;
+            if !checkout_output.status.success() {
+                warn_failed_git_submodule_update(ui, &checkout_output, Some(&path))?;
+                return Ok(());
+            }
+            let recursive_output = std::process::Command::new(&git_executable)
+                .current_dir(&disk_path)
+                .args(["submodule", "update", "--init", "--recursive"])
+                .output()
+                .map_err(|err| {
+                    user_error_with_message(
+                        format!(
+                            "Failed to execute recursive Git submodule update below {}",
+                            path.as_internal_file_string()
+                        ),
+                        err,
+                    )
+                })?;
+            if !recursive_output.status.success() {
+                warn_failed_git_submodule_update(ui, &recursive_output, Some(&path))?;
+                return Ok(());
+            }
+        }
         return Ok(());
     }
 
+    warn_failed_git_submodule_update(ui, &output, None)?;
+    Ok(())
+}
+
+#[cfg(feature = "git")]
+fn force_checkout_nested_jj_workspace(
+    ui: &Ui,
+    git_executable: &Path,
+    workspace_root: &Path,
+    repo_root: &Path,
+    target_id: &CommitId,
+    visited: &mut BTreeSet<PathBuf>,
+) -> Result<bool, CommandError> {
+    let canonical_root = match dunce::canonicalize(repo_root) {
+        Ok(path) if path.starts_with(workspace_root) => path,
+        _ => return Ok(true),
+    };
+    if !visited.insert(canonical_root.clone()) {
+        return Ok(true);
+    }
+
+    let checkout_output = std::process::Command::new(git_executable)
+        .current_dir(&canonical_root)
+        .args(["checkout", "--force", "--detach", &target_id.hex()])
+        .output()
+        .map_err(|err| {
+            user_error_with_message(
+                format!(
+                    "Failed to execute Git while updating nested Jujutsu workspace {}",
+                    canonical_root.display()
+                ),
+                err,
+            )
+        })?;
+    if !checkout_output.status.success() {
+        warn_failed_git_submodule_update(ui, &checkout_output, None)?;
+        return Ok(false);
+    }
+
+    let Ok(repo) = gix::open(&canonical_root) else {
+        return Ok(true);
+    };
+    let Some(submodules) = repo.submodules().ok().flatten() else {
+        return Ok(true);
+    };
+    for submodule in submodules {
+        let Ok(path) = submodule.path() else {
+            continue;
+        };
+        let child_root = canonical_root.join(gix::path::from_bstring(path));
+        if !child_root.join(".jj").is_dir() || !child_root.join(".git").exists() {
+            continue;
+        }
+        let Some(child_id) = submodule
+            .head_id()
+            .ok()
+            .flatten()
+            .map(|id| CommitId::from_bytes(id.as_bytes()))
+        else {
+            continue;
+        };
+        if !force_checkout_nested_jj_workspace(
+            ui,
+            git_executable,
+            workspace_root,
+            &child_root,
+            &child_id,
+            visited,
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn warn_failed_git_submodule_update(
+    ui: &Ui,
+    output: &std::process::Output,
+    path: Option<&RepoPath>,
+) -> io::Result<()> {
     writeln!(
         ui.warning_default(),
-        "Failed to update Git submodules to match the checked-out commit."
+        "Failed to update Git submodules{} to match the checked-out commit.",
+        path.map_or_else(String::new, |path| format!(
+            " below {}",
+            path.as_internal_file_string()
+        ))
     )?;
     if let Some(code) = output.status.code() {
         writeln!(
             ui.warning_default(),
-            "`git submodule update` exited with status code {code}."
+            "Git's submodule command exited with status code {code}."
         )?;
     } else {
         writeln!(
             ui.warning_default(),
-            "`git submodule update` was terminated by signal."
+            "Git's submodule command was terminated by signal."
         )?;
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3478,9 +3732,8 @@ async fn maybe_update_submodules_in_colocated_git_workspace(
     }
     writeln!(
         ui.hint_default(),
-        "Run `git submodule update --init --recursive` manually after resolving the issue."
+        "Resolve the Git error, then retry the Jujutsu command."
     )?;
-
     Ok(())
 }
 

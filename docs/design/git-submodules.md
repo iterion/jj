@@ -7,6 +7,156 @@ submodules.
 This document is a work in progress; submodules are a big feature, and relevant
 details will be filled in incrementally.
 
+## Current command behavior
+
+Jujutsu has experimental submodule support in colocated, Git-backed workspaces.
+The support described in this section is intentionally narrower than the full
+design below, but it covers a useful end-to-end workflow.
+
+### Switching commits
+
+Any command that moves the working copy to another commit, such as `jj edit`,
+`jj new`, `jj prev`, or `jj next`, synchronizes the submodule working copies as
+if the following command had been run:
+
+```shell
+git submodule update --init --recursive
+```
+
+Jujutsu then checks out the gitlink IDs from its working-copy tree. This last
+step matters in a colocated workspace because the Git index represents the
+parent of the Jujutsu working-copy commit. As with Git's default submodule
+update mode, the resulting submodule checkouts usually have detached HEADs.
+When moving away from a captured nested working set, Jujutsu may force the Git
+checkout only at initialized `.jj` workspaces because their prior contents are
+already stored as nested commits. Git-only local changes retain Git's normal
+overwrite protection. The same rule is applied recursively.
+
+`jj status` includes every configured, checked-out Git submodule recursively,
+including clean entries. When an initialized nested Jujutsu working copy
+changes, its effective commit becomes the outer gitlink, so the path appears in
+the ordinary `Working copy changes` summary (for example, `M format`). The
+indented `Submodules` details distinguish captured nested working copies from
+raw Git dirt, unexpected checked-out commits, branch checkouts, invalid
+repositories, and submodules which have not been checked out.
+
+If synchronization fails, the working-copy move still completes and Jujutsu
+prints a warning and the Git error. After correcting authentication, transport,
+or local-change problems, use `jj sub status` from inside the submodule to
+inspect its own working-copy changes before retrying the Jujutsu command.
+
+### Working in a submodule
+
+`jj sub` (also available as the short alias `jj s`) runs an ordinary Jujutsu
+command in a Git submodule. On first use, it initializes a separate colocated
+Jujutsu repository in that submodule. This gives the submodule its own working
+copy, commits, bookmarks, and operation log instead of mixing its files into the
+superproject tree.
+
+From inside the submodule, its path is inferred:
+
+```shell
+cd path/to/submodule
+jj sub status
+jj sub diff
+jj sub commit -m 'Describe the nested change'
+```
+
+From the superproject root, select the submodule with `-S`:
+
+```shell
+jj sub -S path/to/submodule status
+```
+
+Every ordinary outer snapshot first snapshots initialized nested workspaces,
+deepest-first. If the nested `@` contains changes, its commit ID becomes the
+superproject's gitlink. An empty, single-parent `@` collapses to `@-`, avoiding
+a meaningless gitlink change after initialization or `jj commit`. Consequently
+an outer `jj commit` captures the exact nested working set even before the
+nested change is given a description.
+
+### Recovering a nested checkout
+
+If a nested Jujutsu operation leaves a submodule checkout or the outer gitlink
+in an unwanted state, reset one submodule from the superproject root:
+
+```shell
+jj sub -S path/to/submodule --reset
+```
+
+Inside a submodule, its path can be inferred with `jj sub --reset`. To reset
+every checked-out submodule, run `jj sub --reset-all` from either the
+superproject or a nested submodule. Descendant submodules are included: they
+are snapshotted and backed up deepest-first before Git recursively restores the
+checkout hierarchy.
+
+Reset restores only gitlink paths from the parent of the superproject's
+working-copy commit, so unrelated outer changes are kept. Before forcing the
+Git checkouts back to those commits, Jujutsu snapshots each nested workspace
+and moves its `.jj` directory below `.jj/submodule-backups/` in the
+superproject. Moving a saved `<submodule>/.jj` directory back into place
+restores access to its commits and operation log.
+
+### Pointing a submodule at a commit, branch, or tag
+
+Create a nested working-copy commit on the desired revision:
+
+```shell
+jj sub -S path/to/submodule new <commit-or-tag>
+```
+
+A local or remote bookmark works as well. Because the new nested `@` is empty,
+Jujutsu records its parent as the new gitlink value. `jj status` reports the
+submodule path as modified and `jj diff --git` shows a gitlink change. The
+recorded value remains stable across later Jujutsu commands.
+
+### Recording and pushing a change made in a submodule
+
+A gitlink stores a commit ID. In Jujutsu, the nested working copy is already a
+real commit, so the outer working-copy commit can point directly to the dirty
+nested `@` and preserve that working set. For a reviewable, pushable change,
+describe the nested change first and then describe and push the superproject
+change:
+
+```shell
+# edit files
+jj sub -S path/to/submodule commit -m 'Describe the submodule change'
+jj describe -m 'Update path/to/submodule'
+jj bookmark create feature -r @
+jj git push --bookmark feature
+```
+
+Before pushing the superproject reference, `jj git push` pushes each changed,
+checked-out submodule to its own configured upstream. Nested Git submodules are
+pushed with Git's `--recurse-submodules=on-demand` behavior. A failure to push a
+submodule stops the command before the superproject reference is pushed.
+`jj git push --dry-run` does not push either repository.
+
+Jujutsu's synchronization normally detaches submodule HEAD. In that state,
+`jj git push` looks for a single local branch with an upstream that points to
+the recorded gitlink and pushes that branch explicitly. If the commit is
+already reachable from a known remote-tracking ref or tag, no submodule push is
+needed. Ambiguous branches or a new detached commit without such a branch are
+reported as errors instead of guessing a destination.
+
+### Rebasing a moved submodule
+
+If one side of a rebase moves a submodule to a new path while the rebased change
+updates that submodule's gitlink at the old path, `jj rebase` carries the
+gitlink update to the new path. Unrelated delete/add pairs are not treated as a
+move.
+
+### Current limitations
+
+- This workflow requires a colocated, Git-backed workspace.
+- Adding a new submodule still uses Git's `git submodule add` and must create a
+  Git commit before Jujutsu can import the initial gitlink.
+- The nested Jujutsu repository has its own operation log. Coordinating nested
+  and superproject operations, including a single atomic undo, remains future
+  work.
+- Fetching, conflict resolution, and native non-Git Jujutsu submodules remain
+  future work.
+
 ## Objective
 
 This proposal aims to replicate the workflows users are used to with Git
@@ -146,7 +296,16 @@ Possible approaches under discussion. See
 
 ### Snapshotting new submodule changes
 
-TODO
+The experimental colocated implementation gives each initialized submodule a
+separate nested Jujutsu repository. Before the outer filesystem scan, the CLI
+recursively snapshots those repositories. A dirty nested `@` overrides the
+checked-out Git HEAD as the gitlink value; an empty one-parent `@` contributes
+its parent instead. This makes a nested working set an ordinary outer tree
+value and therefore an ordinary diff and commit.
+
+The nested and outer snapshots are currently separate operations. A complete
+implementation should define their atomic relationship, including how one
+`jj undo` operation spans the hierarchy.
 
 ### Merging/rebasing with submodules
 

@@ -36,7 +36,7 @@
       # When we're running in the shell, we want to use rustc with a bunch
       # of extra junk to ensure that rust-analyzer works, clippy etc are all
       # installed.
-      rustShellToolchain = (pkgs.rust-bin.selectLatestNightlyWith (t: t.default)).override {
+      rustShellToolchain = (pkgs.rust-bin.selectLatestNightlyWith (t: t.minimal)).override {
         # NOTE (aseipp): explicitly add rust-src to the rustc compiler only in
         # devShell. this in turn causes a dependency on the rust compiler src,
         # which bloats the closure size by several GiB. but doing this here and
@@ -51,18 +51,8 @@
         ];
       };
 
-      # But, whenever we are running CI builds or checks, we want to use a
-      # smaller closure. This reduces the CI impact on fresh clones/VMs, etc.
-      rustMinimalPlatform = let
-        platform = pkgs.rust-bin.selectLatestNightlyWith (t: t.minimal);
-      in
-        pkgs.makeRustPlatform {
-          rustc = platform;
-          cargo = platform;
-        };
-
       # Keep a stable, lightweight toolchain handy for quick local iteration.
-      rustQuickToolchain = pkgs.rust-bin.stable.latest.default;
+      rustQuickToolchain = pkgs.rust-bin.stable.latest.minimal;
       rustQuickPlatform = pkgs.makeRustPlatform {
         rustc = rustQuickToolchain;
         cargo = rustQuickToolchain;
@@ -72,30 +62,12 @@
 
       packages = {
         jujutsu = pkgs.callPackage ./default.nix {
-          rustPlatform = rustMinimalPlatform;
-          gitRev = self.rev or self.dirtyRev or null;
-        };
-        jujutsu-quick = pkgs.callPackage ./default.nix {
           rustPlatform = rustQuickPlatform;
           gitRev = self.rev or self.dirtyRev or null;
         };
+        jujutsu-quick = self.packages.${system}.jujutsu;
         default = self.packages.${system}.jujutsu;
       };
-
-      checks.jujutsu = self.packages.${system}.jujutsu.overrideAttrs ({...}: {
-        # The default Rust infrastructure runs all builds in the release
-        # profile, which is significantly slower. Run this under the `test`
-        # profile instead, which matches all our other CI systems, Cargo, etc.
-        cargoBuildType = "test";
-        cargoCheckType = "test";
-
-        # By default, `flake check` will want to run the install phase, but
-        # because we override the cargoBuildType, it fails to find the proper
-        # binary. But we don't even care about the binary or even the buildPhase
-        # in this case; just remove them both.
-        buildPhase = "true";
-        installPhase = "touch $out";
-      });
 
       devShells.default = let
         packages = with pkgs; [
@@ -167,6 +139,7 @@
             (with pkgs; [
               rustQuickToolchain
               git
+              uv
             ])
             ++ jujutsu.nativeBuildInputs
             ++ jujutsu.buildInputs;

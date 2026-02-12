@@ -16,6 +16,353 @@ use crate::common::TestEnvironment;
 use crate::common::create_commit_with_files;
 
 #[test]
+fn test_status_git_submodule_checkout_states() {
+    let test_env = TestEnvironment::default();
+
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "submodule"])
+        .success();
+    let submodule_source = test_env.work_dir("submodule");
+    submodule_source.write_file("payload", "v1\n");
+    submodule_source.run_jj(["commit", "-m", "v1"]).success();
+    submodule_source.write_file("payload", "v2\n");
+    submodule_source.run_jj(["commit", "-m", "v2"]).success();
+    let submodule_v1 = submodule_source
+        .run_jj(["log", "--no-graph", "-r", "@--", "-T", "commit_id"])
+        .success()
+        .stdout
+        .raw()
+        .to_owned();
+    let submodule_v2 = submodule_source
+        .run_jj(["log", "--no-graph", "-r", "@-", "-T", "commit_id"])
+        .success()
+        .stdout
+        .raw()
+        .to_owned();
+
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "repo"])
+        .success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &format!("{}/submodule", test_env.env_root().display()),
+            "sub",
+        ])
+        .success();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "Add submodule",
+        ])
+        .success();
+
+    let output = work_dir.run_jj(["status"]).success();
+    assert!(output.stdout.raw().contains(&format!(
+        "Submodules:\n  sub {} (clean)",
+        &submodule_v2[..12]
+    )));
+
+    work_dir.write_file("sub/payload", "dirty\n");
+    let output = work_dir.run_jj(["status"]).success();
+    assert!(
+        !output
+            .stdout
+            .raw()
+            .contains("The working copy has no changes.")
+    );
+    assert!(output.stdout.raw().contains(&format!(
+        "Submodules:\n  sub {} (dirty)",
+        &submodule_v2[..12]
+    )));
+
+    work_dir.write_file("sub/payload", "v2\n");
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-C",
+            "sub",
+            "checkout",
+            "--detach",
+            submodule_v1.trim(),
+        ])
+        .success();
+    let output = work_dir.run_jj(["status"]).success();
+    assert!(output.stdout.raw().contains("M sub"));
+    assert!(output.stdout.raw().contains(&format!(
+        "sub {} (clean; gitlink changed from {})",
+        &submodule_v1[..12],
+        &submodule_v2[..12]
+    )));
+
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "submodule",
+            "deinit",
+            "-f",
+            "sub",
+        ])
+        .success();
+    let output = work_dir.run_jj(["status"]).success();
+    assert!(output.stdout.raw().contains(&format!(
+        "sub {} (not checked out; gitlink changed from {})",
+        &submodule_v1[..12],
+        &submodule_v2[..12]
+    )));
+}
+
+#[test]
+fn test_status_nested_git_submodule_is_dirty() {
+    let test_env = TestEnvironment::default();
+
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "child"])
+        .success();
+    let child_source = test_env.work_dir("child");
+    child_source.write_file("payload", "initial\n");
+    child_source.run_jj(["commit", "-m", "initial"]).success();
+    let child_id = child_source
+        .run_jj(["log", "--no-graph", "-r", "@-", "-T", "commit_id"])
+        .success()
+        .stdout
+        .raw()
+        .to_owned();
+
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "middle"])
+        .success();
+    let middle_source = test_env.work_dir("middle");
+    middle_source
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &format!("{}/child", test_env.env_root().display()),
+            "deep",
+        ])
+        .success();
+    middle_source
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "Add child",
+        ])
+        .success();
+
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "repo"])
+        .success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &format!("{}/middle", test_env.env_root().display()),
+            "sub",
+        ])
+        .success();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+        ])
+        .success();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "Add middle",
+        ])
+        .success();
+
+    let output = work_dir.run_jj(["status"]).success();
+    assert!(
+        output
+            .stdout
+            .raw()
+            .contains(&format!("sub/deep {} (clean)", &child_id[..12]))
+    );
+
+    work_dir.write_file("sub/deep/payload", "dirty nested checkout\n");
+    let output = work_dir.run_jj(["status"]).success();
+    assert!(
+        !output
+            .stdout
+            .raw()
+            .contains("The working copy has no changes.")
+    );
+    assert!(
+        output
+            .stdout
+            .raw()
+            .contains(&format!("sub/deep {} (dirty)", &child_id[..12]))
+    );
+
+    // Once both levels are initialized as nested Jujutsu workspaces, editing
+    // the deepest working copy rewrites its `@`, then the middle `@` records
+    // that gitlink, and finally the outer working copy records the middle `@`.
+    // The whole chain is therefore a normal committable `M sub` change.
+    work_dir.write_file("sub/deep/payload", "initial\n");
+    work_dir.run_jj(["sub", "-S", "sub", "status"]).success();
+    test_env
+        .run_jj_in("repo/sub", ["sub", "-S", "deep", "status"])
+        .success();
+    let output = work_dir.run_jj(["status"]).success();
+    assert!(
+        output
+            .stdout
+            .raw()
+            .contains("The working copy has no changes.")
+    );
+    assert!(output.stdout.raw().contains("clean nested working copy"));
+
+    work_dir.write_file("sub/deep/payload", "nested Jujutsu change\n");
+    let output = work_dir.run_jj(["status"]).success();
+    assert!(
+        output.stdout.raw().contains("Working copy changes:\nM sub"),
+        "expected recursive nested change in the outer diff, got:\n{output:?}"
+    );
+    assert!(
+        output.stdout.raw().contains("  Submodules:\n    sub "),
+        "expected submodule state nested under working-copy changes, got:\n{output:?}"
+    );
+    assert!(
+        output.stdout.raw().contains("nested working copy"),
+        "expected captured nested workspace state, got:\n{output:?}"
+    );
+
+    let deep_working_copy_id = test_env
+        .run_jj_in(
+            "repo/sub/deep",
+            [
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                "@",
+                "-T",
+                "commit_id",
+            ],
+        )
+        .success()
+        .stdout
+        .raw()
+        .to_owned();
+    let middle_tree = test_env
+        .run_jj_in("repo/sub", ["debug", "tree", "deep"])
+        .success();
+    assert!(
+        middle_tree
+            .stdout
+            .raw()
+            .contains(deep_working_copy_id.trim())
+    );
+
+    let middle_working_copy_id = test_env
+        .run_jj_in(
+            "repo/sub",
+            [
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                "@",
+                "-T",
+                "commit_id",
+            ],
+        )
+        .success()
+        .stdout
+        .raw()
+        .to_owned();
+    let outer_tree = work_dir.run_jj(["debug", "tree", "sub"]).success();
+    assert!(
+        outer_tree
+            .stdout
+            .raw()
+            .contains(middle_working_copy_id.trim())
+    );
+
+    work_dir
+        .run_jj(["commit", "-m", "capture recursive nested working set"])
+        .success();
+    let captured_outer_change = work_dir
+        .run_jj(["log", "--no-graph", "-r", "@-", "-T", "change_id"])
+        .success()
+        .stdout
+        .raw()
+        .to_owned();
+    work_dir.run_jj(["edit", "@--"]).success();
+    assert_eq!(work_dir.read_file("sub/deep/payload"), "initial\n");
+    work_dir
+        .run_jj(["edit", captured_outer_change.trim()])
+        .success();
+    assert_eq!(
+        work_dir.read_file("sub/deep/payload"),
+        "nested Jujutsu change\n"
+    );
+}
+
+#[test]
 fn test_status_copies() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();

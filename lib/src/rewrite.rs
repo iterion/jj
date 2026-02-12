@@ -33,6 +33,7 @@ use tracing::instrument;
 use crate::backend::BackendError;
 use crate::backend::BackendResult;
 use crate::backend::CommitId;
+use crate::backend::TreeValue;
 use crate::commit::Commit;
 use crate::commit::CommitIteratorExt as _;
 use crate::commit::conflict_label_for_commits;
@@ -52,6 +53,7 @@ use crate::merged_tree_builder::MergedTreeBuilder;
 use crate::repo::MutableRepo;
 use crate::repo::Repo;
 use crate::repo_path::RepoPath;
+use crate::repo_path::RepoPathBuf;
 use crate::revset::RevsetExpression;
 use crate::revset::RevsetStreamExt as _;
 use crate::store::Store;
@@ -264,6 +266,112 @@ pub async fn rebase_commit(
     builder.write().await
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ResolvedSubmodulePathValue {
+    Absent,
+    Submodule(CommitId),
+    Other,
+    Conflict,
+}
+
+async fn resolved_submodule_path_value(
+    tree: &MergedTree,
+    path: &RepoPath,
+) -> BackendResult<ResolvedSubmodulePathValue> {
+    match tree.path_value(path).await?.into_resolved() {
+        Ok(None) => Ok(ResolvedSubmodulePathValue::Absent),
+        Ok(Some(TreeValue::GitSubmodule(id))) => Ok(ResolvedSubmodulePathValue::Submodule(id)),
+        Ok(Some(_)) => Ok(ResolvedSubmodulePathValue::Other),
+        Err(_) => Ok(ResolvedSubmodulePathValue::Conflict),
+    }
+}
+
+fn collect_resolved_git_submodules(
+    tree: &MergedTree,
+) -> BackendResult<HashMap<RepoPathBuf, CommitId>> {
+    let mut submodules = HashMap::new();
+    for (path, value) in tree.entries() {
+        let value = value?;
+        if let Some(TreeValue::GitSubmodule(id)) = value.as_normal() {
+            submodules.insert(path, id.clone());
+        }
+    }
+    Ok(submodules)
+}
+
+async fn remap_moved_submodule_paths_in_rebased_tree(
+    old_base_tree: &MergedTree,
+    new_base_tree: &MergedTree,
+    old_tree: &MergedTree,
+    rebased_tree: &MergedTree,
+) -> BackendResult<MergedTree> {
+    let old_submodules = collect_resolved_git_submodules(old_base_tree)?;
+    if old_submodules.is_empty() {
+        return Ok(rebased_tree.clone());
+    }
+    let new_submodules = collect_resolved_git_submodules(new_base_tree)?;
+    if new_submodules.is_empty() {
+        return Ok(rebased_tree.clone());
+    }
+
+    let mut new_paths_by_id: HashMap<CommitId, Vec<RepoPathBuf>> = HashMap::new();
+    for (path, id) in &new_submodules {
+        if !old_submodules.contains_key(path) {
+            new_paths_by_id
+                .entry(id.clone())
+                .or_default()
+                .push(path.clone());
+        }
+    }
+
+    let mut remapped_updates: Vec<(RepoPathBuf, RepoPathBuf, Option<CommitId>)> = vec![];
+    for (old_path, old_id) in &old_submodules {
+        if new_submodules.contains_key(old_path) {
+            continue;
+        }
+        let Some(candidates) = new_paths_by_id.get(old_id) else {
+            continue;
+        };
+        if candidates.len() != 1 {
+            continue;
+        }
+        let new_path = &candidates[0];
+
+        let old_path_update = match resolved_submodule_path_value(old_tree, old_path).await? {
+            ResolvedSubmodulePathValue::Submodule(id) => Some(id),
+            ResolvedSubmodulePathValue::Absent => None,
+            ResolvedSubmodulePathValue::Other | ResolvedSubmodulePathValue::Conflict => continue,
+        };
+        if old_path_update.as_ref() == Some(old_id) {
+            continue;
+        }
+
+        // If the source commit has a value at the destination path already, we
+        // cannot safely infer how to remap this update.
+        if resolved_submodule_path_value(old_tree, new_path).await?
+            != ResolvedSubmodulePathValue::Absent
+        {
+            continue;
+        }
+
+        remapped_updates.push((old_path.clone(), new_path.clone(), old_path_update));
+    }
+
+    if remapped_updates.is_empty() {
+        return Ok(rebased_tree.clone());
+    }
+
+    let mut builder = MergedTreeBuilder::new(rebased_tree.clone());
+    for (old_path, new_path, maybe_submodule_id) in remapped_updates {
+        builder.set_or_remove(old_path, Merge::absent());
+        match maybe_submodule_id {
+            Some(id) => builder.set_or_remove(new_path, Merge::normal(TreeValue::GitSubmodule(id))),
+            None => builder.set_or_remove(new_path, Merge::absent()),
+        }
+    }
+    builder.write_tree().await
+}
+
 /// Helps rewrite a commit.
 pub struct CommitRewriter<'repo> {
     mut_repo: &'repo mut MutableRepo,
@@ -394,28 +502,35 @@ impl<'repo> CommitRewriter<'repo> {
             let new_base_tree_fut = merge_commit_trees(self.mut_repo, &new_parents);
             let old_tree = self.old_commit.tree();
             let (old_base_tree, new_base_tree) = try_join!(old_base_tree_fut, new_base_tree_fut)?;
+            let rebased_tree = MergedTree::merge(Merge::from_vec(vec![
+                (
+                    new_base_tree.clone(),
+                    format!(
+                        "{} (rebase destination)",
+                        conflict_label_for_commits(&new_parents)
+                    ),
+                ),
+                (
+                    old_base_tree.clone(),
+                    format!(
+                        "{} (parents of rebased revision)",
+                        conflict_label_for_commits(&old_parents)
+                    ),
+                ),
+                (
+                    old_tree.clone(),
+                    format!("{} (rebased revision)", self.old_commit.conflict_label()),
+                ),
+            ]))
+            .await?;
             (
                 old_base_tree.tree_ids() == self.old_commit.tree_ids(),
-                MergedTree::merge(Merge::from_vec(vec![
-                    (
-                        new_base_tree,
-                        format!(
-                            "{} (rebase destination)",
-                            conflict_label_for_commits(&new_parents)
-                        ),
-                    ),
-                    (
-                        old_base_tree,
-                        format!(
-                            "{} (parents of rebased revision)",
-                            conflict_label_for_commits(&old_parents)
-                        ),
-                    ),
-                    (
-                        old_tree,
-                        format!("{} (rebased revision)", self.old_commit.conflict_label()),
-                    ),
-                ]))
+                remap_moved_submodule_paths_in_rebased_tree(
+                    &old_base_tree,
+                    &new_base_tree,
+                    &old_tree,
+                    &rebased_tree,
+                )
                 .await?,
             )
         };

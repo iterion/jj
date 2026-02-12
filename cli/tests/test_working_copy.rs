@@ -762,3 +762,503 @@ fn test_colocated_checkout_updates_submodule_working_copy() {
     work_dir.run_jj(["next"]).success();
     assert_eq!(work_dir.read_file("sub/sub"), "v1\n");
 }
+
+#[test]
+fn test_sub_runs_jj_in_nested_submodule() {
+    let test_env = TestEnvironment::default();
+
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "submodule"])
+        .success();
+    let submodule_source = test_env.work_dir("submodule");
+    submodule_source.write_file("payload", "initial\n");
+    submodule_source
+        .run_jj(["commit", "-m", "initial"])
+        .success();
+
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "repo"])
+        .success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &format!("{}/submodule", test_env.env_root().display()),
+            "sub",
+        ])
+        .success();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "Add submodule",
+        ])
+        .success();
+    work_dir.run_jj(["status"]).success();
+
+    work_dir.write_file("sub/payload", "nested change\n");
+    let output = test_env
+        .run_jj_in("repo/sub", ["sub", "-S", ".", "status"])
+        .success();
+    assert!(work_dir.root().join("sub/.jj").is_dir());
+    assert!(
+        output.stdout.raw().contains("M payload"),
+        "expected nested status to include the dirty file, got:\n{output:?}"
+    );
+    // Once initialized, the nearest workspace changes from the superproject to
+    // the nested repository. The same relative selector should keep working.
+    let output = test_env
+        .run_jj_in("repo/sub", ["sub", "-S", ".", "status"])
+        .success();
+    assert!(
+        output.stdout.raw().contains("M payload"),
+        "expected -S . to select the initialized nested repository, got:\n{output:?}"
+    );
+    let output = work_dir.run_jj(["sub", "-S", "sub", "status"]).success();
+    assert!(
+        output.stdout.raw().contains("M payload"),
+        "expected -S to select the nested repository, got:\n{output:?}"
+    );
+
+    // The nested working-copy commit itself is now the outer gitlink. This
+    // makes the submodule a normal, committable outer working-copy change even
+    // before the nested change has been described with `jj commit`.
+    let nested_working_copy_id = test_env
+        .run_jj_in(
+            "repo/sub",
+            [
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                "@",
+                "-T",
+                "commit_id",
+            ],
+        )
+        .success()
+        .stdout
+        .raw()
+        .to_owned();
+    let output = work_dir.run_jj(["status"]).success();
+    assert!(
+        output.stdout.raw().contains("Working copy changes:\nM sub"),
+        "expected the nested working set in normal outer changes, got:\n{output:?}"
+    );
+    let output = work_dir.run_jj(["debug", "tree", "sub"]).success();
+    assert!(
+        output.stdout.raw().contains(nested_working_copy_id.trim()),
+        "expected outer gitlink to point at nested @, got:\n{output:?}"
+    );
+    work_dir
+        .run_jj(["commit", "-m", "capture nested working set"])
+        .success();
+    let output = work_dir
+        .run_jj(["debug", "tree", "-r", "@-", "sub"])
+        .success();
+    assert!(
+        output.stdout.raw().contains(nested_working_copy_id.trim()),
+        "expected outer commit to retain the exact nested working set, got:\n{output:?}"
+    );
+    let output = work_dir.run_jj(["status"]).success();
+    assert!(
+        output
+            .stdout
+            .raw()
+            .contains("The working copy has no changes."),
+        "expected the captured nested working set to be clean outside, got:\n{output:?}"
+    );
+    assert!(output.stdout.raw().contains("nested working copy"));
+
+    let captured_outer_change = work_dir
+        .run_jj(["log", "--no-graph", "-r", "@-", "-T", "change_id"])
+        .success()
+        .stdout
+        .raw()
+        .to_owned();
+    work_dir.run_jj(["edit", "@--"]).success();
+    assert_eq!(work_dir.read_file("sub/payload"), "initial\n");
+    work_dir
+        .run_jj(["edit", captured_outer_change.trim()])
+        .success();
+    assert_eq!(work_dir.read_file("sub/payload"), "nested change\n");
+
+    test_env
+        .run_jj_in("repo/sub", ["s", "commit", "-m", "nested change"])
+        .success();
+    let output = work_dir.run_jj(["diff", "--git"]).success();
+    assert!(
+        output.stdout.raw().contains("diff --git a/sub b/sub"),
+        "expected the outer working copy to record the nested commit, got:\n{output:?}"
+    );
+    let output = test_env
+        .run_jj_in(
+            "repo/sub",
+            [
+                "log",
+                "--no-graph",
+                "-r",
+                "@-",
+                "-T",
+                "description.first_line()",
+            ],
+        )
+        .success();
+    assert_eq!(output.stdout.raw(), "nested change");
+}
+
+#[test]
+fn test_sub_reset_preserves_nested_history_and_outer_changes() {
+    let test_env = TestEnvironment::default();
+
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "submodule"])
+        .success();
+    let submodule_source = test_env.work_dir("submodule");
+    submodule_source.write_file("payload", "initial\n");
+    submodule_source
+        .run_jj(["commit", "-m", "initial"])
+        .success();
+
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "repo"])
+        .success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &format!("{}/submodule", test_env.env_root().display()),
+            "sub",
+        ])
+        .success();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "Add submodule",
+        ])
+        .success();
+    work_dir.run_jj(["status"]).success();
+    work_dir.write_file("outer", "base\n");
+    work_dir.run_jj(["commit", "-m", "outer base"]).success();
+
+    work_dir.write_file("outer", "unrelated outer change\n");
+    work_dir.write_file("sub/payload", "valuable nested change\n");
+    test_env
+        .run_jj_in(
+            "repo/sub",
+            ["sub", "commit", "-m", "valuable nested change"],
+        )
+        .success();
+    let nested_change_id = test_env
+        .run_jj_in(
+            "repo/sub",
+            ["log", "--no-graph", "-r", "@-", "-T", "change_id"],
+        )
+        .success()
+        .stdout
+        .raw()
+        .to_owned();
+    let summary = work_dir.run_jj(["diff", "--summary"]).success();
+    assert!(summary.stdout.raw().contains("M outer"));
+    assert!(summary.stdout.raw().contains("M sub"));
+
+    test_env.run_jj_in("repo/sub", ["sub", "--reset"]).success();
+    assert!(!work_dir.root().join("sub/.jj").exists());
+    assert_eq!(work_dir.read_file("sub/payload"), "initial\n");
+    let summary = work_dir.run_jj(["diff", "--summary"]).success();
+    assert!(summary.stdout.raw().contains("M outer"));
+    assert!(!summary.stdout.raw().lines().any(|line| line == "M sub"));
+
+    let backups_root = work_dir.root().join(".jj/submodule-backups");
+    let backup_run = std::fs::read_dir(&backups_root)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let backup_jj = backup_run.join("sub/.jj");
+    assert!(backup_jj.is_dir());
+
+    // Moving the metadata back makes the nested change addressable again.
+    std::fs::rename(backup_jj, work_dir.root().join("sub/.jj")).unwrap();
+    let output = test_env
+        .run_jj_in(
+            "repo/sub",
+            [
+                "--ignore-working-copy",
+                "show",
+                "-r",
+                nested_change_id.trim(),
+            ],
+        )
+        .success();
+    assert!(output.stdout.raw().contains("valuable nested change"));
+}
+
+#[test]
+fn test_sub_reset_all_preserves_descendant_nested_history() {
+    let test_env = TestEnvironment::default();
+
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "child"])
+        .success();
+    let child_source = test_env.work_dir("child");
+    child_source.write_file("payload", "initial\n");
+    child_source.run_jj(["commit", "-m", "initial"]).success();
+
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "middle"])
+        .success();
+    let middle_source = test_env.work_dir("middle");
+    middle_source
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &format!("{}/child", test_env.env_root().display()),
+            "deep",
+        ])
+        .success();
+    middle_source
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "Add deep submodule",
+        ])
+        .success();
+
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "repo"])
+        .success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &format!("{}/middle", test_env.env_root().display()),
+            "sub",
+        ])
+        .success();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+        ])
+        .success();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "Add middle submodule",
+        ])
+        .success();
+    work_dir.run_jj(["status"]).success();
+
+    work_dir.write_file("sub/deep/payload", "valuable deep change\n");
+    work_dir
+        .run_jj([
+            "sub",
+            "-S",
+            "sub",
+            "sub",
+            "-S",
+            "deep",
+            "commit",
+            "-m",
+            "valuable deep change",
+        ])
+        .success();
+    assert!(work_dir.root().join("sub/.jj").is_dir());
+    assert!(work_dir.root().join("sub/deep/.jj").is_dir());
+    let deep_change_id = test_env
+        .run_jj_in(
+            "repo/sub/deep",
+            ["log", "--no-graph", "-r", "@-", "-T", "change_id"],
+        )
+        .success()
+        .stdout
+        .raw()
+        .to_owned();
+
+    work_dir.run_jj(["sub", "--reset-all"]).success();
+    assert!(!work_dir.root().join("sub/.jj").exists());
+    assert!(!work_dir.root().join("sub/deep/.jj").exists());
+    assert_eq!(work_dir.read_file("sub/deep/payload"), "initial\n");
+
+    let backups_root = work_dir.root().join(".jj/submodule-backups");
+    let backup_run = std::fs::read_dir(&backups_root)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(backup_run.join("sub/.jj").is_dir());
+    let backup_deep_jj = backup_run.join("sub/deep/.jj");
+    assert!(backup_deep_jj.is_dir());
+
+    std::fs::rename(backup_deep_jj, work_dir.root().join("sub/deep/.jj")).unwrap();
+    test_env
+        .run_jj_in(
+            "repo/sub/deep",
+            ["--ignore-working-copy", "show", "-r", deep_change_id.trim()],
+        )
+        .success();
+}
+
+#[test]
+fn test_colocated_snapshot_records_submodule_head_change() {
+    let test_env = TestEnvironment::default();
+
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "submodule"])
+        .success();
+    let submodule_dir = test_env.work_dir("submodule");
+    for version in ["v1", "v2", "v3"] {
+        submodule_dir.write_file("payload", format!("{version}\n"));
+        submodule_dir.run_jj(["commit", "-m", version]).success();
+    }
+    submodule_dir
+        .run_jj(["bookmark", "create", "topic", "-r", "@--"])
+        .success();
+    submodule_dir
+        .run_jj(["tag", "set", "release", "-r", "@---"])
+        .success();
+    let submodule_v1 = submodule_dir
+        .run_jj(["util", "exec", "--", "git", "rev-parse", "HEAD~2"])
+        .success()
+        .stdout
+        .raw()
+        .trim()
+        .to_owned();
+    let submodule_v2 = submodule_dir
+        .run_jj(["util", "exec", "--", "git", "rev-parse", "HEAD~1"])
+        .success()
+        .stdout
+        .raw()
+        .trim()
+        .to_owned();
+
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "repo"])
+        .success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &format!("{}/submodule", test_env.env_root().display()),
+            "sub",
+        ])
+        .success();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "Add submodule at v3",
+        ])
+        .success();
+
+    for (revision, expected_id) in [
+        (submodule_v1.as_str(), submodule_v1.as_str()),
+        ("origin/topic", submodule_v2.as_str()),
+        ("release", submodule_v1.as_str()),
+    ] {
+        work_dir
+            .run_jj([
+                "util", "exec", "--", "git", "-C", "sub", "checkout", revision,
+            ])
+            .success();
+        work_dir.run_jj(["status"]).success();
+
+        let output = work_dir.run_jj(["diff", "--git"]).success();
+        let diff = output.stdout.raw();
+        assert!(
+            diff.contains("diff --git a/sub b/sub"),
+            "expected a gitlink diff after checking out {revision}, got:\n{diff}"
+        );
+        assert!(
+            diff.contains(&expected_id[..10]),
+            "expected gitlink to point to {expected_id} after checking out {revision}, got:\n{diff}"
+        );
+    }
+}

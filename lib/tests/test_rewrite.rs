@@ -1442,6 +1442,125 @@ fn test_rebase_descendants_contents() -> TestResult {
 }
 
 #[test]
+fn test_rebase_commit_submodule_path_move_on_destination() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+
+    let mut tx = repo.start_transaction();
+    let submodule_v1 = write_random_commit(tx.repo_mut());
+    let submodule_v2 = write_random_commit(tx.repo_mut());
+    let gitmodules_modules = "[submodule \"lib\"]\n\tpath = modules/lib\n\turl = ../submodule\n";
+    let gitmodules_deps = "[submodule \"lib\"]\n\tpath = deps/lib\n\turl = ../submodule\n";
+
+    let tree_base = create_tree_with(repo, |builder| {
+        builder.file(repo_path(".gitmodules"), gitmodules_modules);
+        builder.submodule(repo_path("modules/lib"), submodule_v2.id().clone());
+    });
+    let commit_base = tx
+        .repo_mut()
+        .new_commit(vec![repo.store().root_commit_id().clone()], tree_base)
+        .write_unwrap();
+
+    let tree_source = create_tree_with(repo, |builder| {
+        builder.file(repo_path(".gitmodules"), gitmodules_modules);
+        builder.submodule(repo_path("modules/lib"), submodule_v1.id().clone());
+    });
+    let commit_source = tx
+        .repo_mut()
+        .new_commit(vec![commit_base.id().clone()], tree_source)
+        .write_unwrap();
+
+    let tree_destination = create_tree_with(repo, |builder| {
+        builder.file(repo_path(".gitmodules"), gitmodules_deps);
+        builder.submodule(repo_path("deps/lib"), submodule_v2.id().clone());
+    });
+    let commit_destination = tx
+        .repo_mut()
+        .new_commit(vec![commit_base.id().clone()], tree_destination)
+        .write_unwrap();
+
+    let rewriter = CommitRewriter::new(
+        tx.repo_mut(),
+        commit_source,
+        vec![commit_destination.id().clone()],
+    );
+    let rebased_commit =
+        match rebase_commit_with_options(rewriter, &RebaseOptions::default()).block_on()? {
+            RebasedCommit::Rewritten(commit) => commit,
+            RebasedCommit::Abandoned { .. } => panic!("submodule rebase should not be abandoned"),
+        };
+
+    let expected_tree = create_tree_with(repo, |builder| {
+        builder.file(repo_path(".gitmodules"), gitmodules_deps);
+        builder.submodule(repo_path("deps/lib"), submodule_v1.id().clone());
+    });
+    assert_eq!(
+        rebased_commit.parent_ids(),
+        vec![commit_destination.id().clone()]
+    );
+    assert_tree_eq!(rebased_commit.tree(), expected_tree);
+    Ok(())
+}
+
+#[test]
+fn test_rebase_commit_submodule_path_move_does_not_override_destination_path_update() -> TestResult
+{
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+
+    let mut tx = repo.start_transaction();
+    let submodule_v2 = write_random_commit(tx.repo_mut());
+    let gitmodules_modules = "[submodule \"lib\"]\n\tpath = modules/lib\n\turl = ../submodule\n";
+    let gitmodules_deps = "[submodule \"lib\"]\n\tpath = deps/lib\n\turl = ../submodule\n";
+
+    let tree_base = create_tree_with(repo, |builder| {
+        builder.file(repo_path(".gitmodules"), gitmodules_modules);
+        builder.submodule(repo_path("modules/lib"), submodule_v2.id().clone());
+    });
+    let commit_base = tx
+        .repo_mut()
+        .new_commit(vec![repo.store().root_commit_id().clone()], tree_base)
+        .write_unwrap();
+
+    // Source delete+add touches the destination path directly.
+    let tree_source = create_tree_with(repo, |builder| {
+        builder.file(repo_path(".gitmodules"), gitmodules_modules);
+        builder.submodule(repo_path("deps/lib"), submodule_v2.id().clone());
+    });
+    let commit_source = tx
+        .repo_mut()
+        .new_commit(vec![commit_base.id().clone()], tree_source)
+        .write_unwrap();
+
+    let tree_destination = create_tree_with(repo, |builder| {
+        builder.file(repo_path(".gitmodules"), gitmodules_deps);
+        builder.submodule(repo_path("deps/lib"), submodule_v2.id().clone());
+    });
+    let commit_destination = tx
+        .repo_mut()
+        .new_commit(vec![commit_base.id().clone()], tree_destination.clone())
+        .write_unwrap();
+
+    let rewriter = CommitRewriter::new(
+        tx.repo_mut(),
+        commit_source,
+        vec![commit_destination.id().clone()],
+    );
+    let rebased_commit =
+        match rebase_commit_with_options(rewriter, &RebaseOptions::default()).block_on()? {
+            RebasedCommit::Rewritten(commit) => commit,
+            RebasedCommit::Abandoned { .. } => panic!("submodule rebase should not be abandoned"),
+        };
+
+    assert_eq!(
+        rebased_commit.parent_ids(),
+        vec![commit_destination.id().clone()]
+    );
+    assert_tree_eq!(rebased_commit.tree(), tree_destination);
+    Ok(())
+}
+
+#[test]
 fn test_rebase_descendants_basic_bookmark_update() -> TestResult {
     let test_repo = TestRepo::init();
     let repo = &test_repo.repo;

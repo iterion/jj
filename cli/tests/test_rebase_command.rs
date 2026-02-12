@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::common::create_commit;
+use crate::common::create_commit_with_files;
 use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
-use crate::common::create_commit;
-use crate::common::create_commit_with_files;
 
 #[test]
 fn test_rebase_invalid() {
@@ -3074,6 +3074,251 @@ fn test_rebase_simplify_parents() {
     ◆    zzzzzzzz  00000000
     [EOF]
     ");
+}
+
+#[test]
+fn test_rebase_submodule_path_move_on_destination() {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "submodule"])
+        .success();
+    let submodule_dir = test_env.work_dir("submodule");
+    submodule_dir.write_file("payload", "v1\n");
+    submodule_dir
+        .run_jj(["commit", "-m", "submodule v1"])
+        .success();
+    submodule_dir.write_file("payload", "v2\n");
+    submodule_dir
+        .run_jj(["commit", "-m", "submodule v2"])
+        .success();
+    let submodule_v1_oid = submodule_dir
+        .run_jj(["util", "exec", "--", "git", "rev-parse", "HEAD~1"])
+        .success()
+        .stdout
+        .raw()
+        .trim()
+        .to_owned();
+
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "repo"])
+        .success();
+    let work_dir = test_env.work_dir("repo");
+
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &format!("{}/submodule", test_env.env_root().display()),
+            "modules/lib",
+        ])
+        .success();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "base with submodule at modules/lib",
+        ])
+        .success();
+
+    work_dir
+        .run_jj(["util", "exec", "--", "git", "switch", "-c", "mainline"])
+        .success();
+    work_dir
+        .run_jj(["util", "exec", "--", "git", "switch", "-c", "feature"])
+        .success();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-C",
+            "modules/lib",
+            "checkout",
+            "HEAD~1",
+        ])
+        .success();
+    work_dir
+        .run_jj(["util", "exec", "--", "git", "add", "modules/lib"])
+        .success();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "feature updates submodule revision",
+        ])
+        .success();
+    work_dir
+        .run_jj(["bookmark", "create", "feature-jj", "-r", "@-"])
+        .success();
+    insta::assert_snapshot!(
+        work_dir.run_jj([
+            "diff",
+            "--summary",
+            "--from",
+            "feature-jj-",
+            "--to",
+            "feature-jj",
+        ])
+        .stdout
+        .raw(),
+        @"M modules/lib
+"
+    );
+
+    work_dir
+        .run_jj(["util", "exec", "--", "git", "switch", "mainline"])
+        .success();
+    let gitlink_oid_output = work_dir
+        .run_jj(["util", "exec", "--", "git", "rev-parse", "HEAD:modules/lib"])
+        .success();
+    let gitlink_oid = gitlink_oid_output.stdout.raw().trim().to_owned();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "update-index",
+            "--force-remove",
+            "modules/lib",
+        ])
+        .success();
+    let cache_info_arg = format!("160000,{gitlink_oid},deps/lib");
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &cache_info_arg,
+        ])
+        .success();
+    let gitmodules_content = String::from_utf8(work_dir.read_file(".gitmodules").into()).unwrap();
+    work_dir.write_file(
+        ".gitmodules",
+        gitmodules_content.replace("modules/lib", "deps/lib"),
+    );
+    work_dir
+        .run_jj(["util", "exec", "--", "git", "add", ".gitmodules"])
+        .success();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "destination moves submodule to deps/lib",
+        ])
+        .success();
+    work_dir
+        .run_jj(["bookmark", "create", "main-jj", "-r", "@-"])
+        .success();
+    insta::assert_snapshot!(
+        work_dir
+            .run_jj(["diff", "--summary", "--from", "main-jj-", "--to", "main-jj"])
+            .stdout
+            .raw(),
+        @r"
+    M .gitmodules
+    A deps/lib
+    D modules/lib
+    "
+    );
+
+    work_dir
+        .run_jj(["rebase", "-r", "feature-jj", "-d", "main-jj"])
+        .success();
+    insta::assert_snapshot!(
+        work_dir.run_jj([
+            "diff",
+            "--summary",
+            "--from",
+            "main-jj",
+            "--to",
+            "feature-jj",
+        ])
+        .stdout
+        .raw(),
+        @"M deps/lib
+"
+    );
+    let feature_commit_id = work_dir
+        .run_jj(["log", "--no-graph", "-r", "feature-jj", "-T", "commit_id"])
+        .success()
+        .stdout
+        .raw()
+        .trim()
+        .to_owned();
+    let tree_paths = work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "ls-tree",
+            "-r",
+            "--name-only",
+            &feature_commit_id,
+        ])
+        .success()
+        .stdout
+        .raw()
+        .to_owned();
+    insta::assert_snapshot!(
+        tree_paths,
+        @r"
+    .gitmodules
+    deps/lib
+    "
+    );
+
+    let deps_lib_oid = work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "rev-parse",
+            &format!("{feature_commit_id}:deps/lib"),
+        ])
+        .success()
+        .stdout
+        .raw()
+        .trim()
+        .to_owned();
+    assert_eq!(deps_lib_oid, submodule_v1_oid);
 }
 
 #[must_use]

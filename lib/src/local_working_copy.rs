@@ -16,6 +16,8 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
+#[cfg(feature = "git")]
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
@@ -62,6 +64,8 @@ use tracing::instrument;
 use tracing::trace_span;
 
 use crate::backend::BackendError;
+#[cfg(feature = "git")]
+use crate::backend::CommitId;
 use crate::backend::CopyId;
 use crate::backend::FileId;
 use crate::backend::MergedTreeValue;
@@ -1300,6 +1304,10 @@ impl TreeState {
             start_tracking_matcher,
             force_tracking_matcher,
             max_new_file_size,
+            #[cfg(not(feature = "git"))]
+                git_submodule_ids: _,
+            #[cfg(feature = "git")]
+            git_submodule_ids,
         } = options;
 
         let sparse_matcher = self.sparse_matcher();
@@ -1333,6 +1341,20 @@ impl TreeState {
         let (invalid_utf8_paths_tx, invalid_utf8_paths_rx) = channel();
         let (deleted_files_tx, deleted_files_rx) = channel();
 
+        #[cfg(feature = "git")]
+        if let Some(git_submodule_ids) = *git_submodule_ids {
+            // Coordinated nested workspaces are authoritative even when an
+            // ignored parent directory or filesystem monitor prevents the
+            // ordinary directory walk from reaching a tracked gitlink.
+            for (path, id) in git_submodule_ids {
+                let current_value = self.tree.path_value(path).await?;
+                if matches!(current_value.as_normal(), Some(TreeValue::GitSubmodule(_))) {
+                    let value = Merge::normal(TreeValue::GitSubmodule(id.clone()));
+                    tree_entries_tx.send((path.clone(), value)).ok();
+                }
+            }
+        }
+
         trace_span!("traverse filesystem").in_scope(|| -> Result<(), SnapshotError> {
             let snapshotter = FileSnapshotter {
                 tree_state: self,
@@ -1349,6 +1371,8 @@ impl TreeState {
                 error: OnceLock::new(),
                 progress: *progress,
                 max_new_file_size: *max_new_file_size,
+                #[cfg(feature = "git")]
+                git_submodule_ids: *git_submodule_ids,
             };
             let directory_to_visit = DirectoryToVisit {
                 dir: RepoPathBuf::root(),
@@ -1524,6 +1548,8 @@ struct FileSnapshotter<'a> {
     error: OnceLock<SnapshotError>,
     progress: Option<&'a SnapshotProgress<'a>>,
     max_new_file_size: u64,
+    #[cfg(feature = "git")]
+    git_submodule_ids: Option<&'a BTreeMap<RepoPathBuf, CommitId>>,
 }
 
 impl FileSnapshotter<'_> {
@@ -1623,6 +1649,10 @@ impl FileSnapshotter<'_> {
         if let Some(file_state) = &maybe_current_file_state
             && file_state.file_type == FileType::GitSubmodule
         {
+            #[cfg(feature = "git")]
+            if self.matcher.matches(&path) && file_type.is_dir() {
+                self.snapshot_git_submodule_head(path, &entry.path());
+            }
             return Ok(None);
         }
 
@@ -1720,6 +1750,29 @@ impl FileSnapshotter<'_> {
         } else {
             Ok(None)
         }
+    }
+
+    #[cfg(feature = "git")]
+    fn snapshot_git_submodule_head(&self, path: RepoPathBuf, disk_path: &Path) {
+        if let Some(id) = self
+            .git_submodule_ids
+            .and_then(|submodule_ids| submodule_ids.get(&path))
+        {
+            let value = Merge::normal(TreeValue::GitSubmodule(id.clone()));
+            self.tree_entries_tx.send((path, value)).ok();
+            return;
+        }
+        let Ok(git_repo) = gix::open(disk_path) else {
+            // An uninitialized submodule is represented by an empty directory.
+            return;
+        };
+        let Ok(head_id) = git_repo.head_id() else {
+            return;
+        };
+        let value = Merge::normal(TreeValue::GitSubmodule(CommitId::from_bytes(
+            head_id.as_bytes(),
+        )));
+        self.tree_entries_tx.send((path, value)).ok();
     }
 
     /// Visits only paths we're already tracking.

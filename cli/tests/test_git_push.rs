@@ -98,6 +98,213 @@ fn test_git_push_nothing() {
 }
 
 #[test]
+fn test_git_push_recurses_into_checked_out_submodule_branch() {
+    let test_env = TestEnvironment::default();
+
+    let submodule_origin_path = test_env.env_root().join("submodule-origin.git");
+    let submodule_origin = git::init_bare(&submodule_origin_path);
+    git::set_symbolic_reference(&submodule_origin, "HEAD", "refs/heads/main");
+
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "submodule-source"])
+        .success();
+    let submodule_source = test_env.work_dir("submodule-source");
+    submodule_source.write_file("payload", "v1\n");
+    submodule_source.run_jj(["commit", "-m", "v1"]).success();
+    submodule_source
+        .run_jj(["bookmark", "create", "main", "-r", "@-"])
+        .success();
+    submodule_source
+        .run_jj([
+            "git",
+            "remote",
+            "add",
+            "origin",
+            submodule_origin_path.to_str().unwrap(),
+        ])
+        .success();
+    submodule_source
+        .run_jj(["git", "push", "--bookmark", "main"])
+        .success();
+    let initial_submodule_head = git::open(&submodule_origin_path)
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .id()
+        .detach();
+
+    let superproject_origin_path = test_env.env_root().join("superproject-origin.git");
+    git::init_bare(&superproject_origin_path);
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "repo"])
+        .success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir
+        .run_jj([
+            "git",
+            "remote",
+            "add",
+            "origin",
+            superproject_origin_path.to_str().unwrap(),
+        ])
+        .success();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            submodule_origin_path.to_str().unwrap(),
+            "sub",
+        ])
+        .success();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "base",
+        ])
+        .success();
+    work_dir.run_jj(["status"]).success();
+    work_dir
+        .run_jj(["bookmark", "create", "main", "-r", "@-"])
+        .success();
+    work_dir
+        .run_jj(["git", "push", "--bookmark", "main"])
+        .success();
+    work_dir
+        .run_jj(["util", "exec", "--", "git", "-C", "sub", "switch", "main"])
+        .success();
+
+    work_dir.write_file("sub/payload", "v2\n");
+    work_dir
+        .run_jj(["util", "exec", "--", "git", "-C", "sub", "add", "payload"])
+        .success();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-C",
+            "sub",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "v2",
+        ])
+        .success();
+    let updated_submodule_head = git::open(work_dir.root().join("sub"))
+        .head_id()
+        .unwrap()
+        .detach();
+    assert_ne!(initial_submodule_head, updated_submodule_head);
+
+    let status = work_dir.run_jj(["status"]).success();
+    assert!(
+        status.stdout.raw().contains("M sub"),
+        "expected nested HEAD change to be snapshotted, got:\n{status:?}"
+    );
+    work_dir
+        .run_jj(["describe", "-m", "update submodule"])
+        .success();
+    work_dir
+        .run_jj(["bookmark", "create", "feature", "-r", "@"])
+        .success();
+    let diff = work_dir
+        .run_jj(["diff", "-r", "feature", "--git"])
+        .success();
+    assert!(
+        diff.stdout
+            .raw()
+            .contains(&updated_submodule_head.to_string()[..10]),
+        "expected feature to record the updated gitlink, got:\n{diff:?}"
+    );
+    work_dir
+        .run_jj(["git", "push", "--dry-run", "--bookmark", "feature"])
+        .success();
+    let dry_run_submodule_head = git::open(&submodule_origin_path)
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .id()
+        .detach();
+    assert_eq!(dry_run_submodule_head, initial_submodule_head);
+    assert!(
+        git::open(&superproject_origin_path)
+            .try_find_reference("refs/heads/feature")
+            .unwrap()
+            .is_none()
+    );
+    let output = work_dir
+        .run_jj(["git", "push", "--bookmark", "feature"])
+        .success();
+    assert!(
+        output.stderr.raw().contains("Pushed Git submodule sub."),
+        "expected recursive submodule push status, got:\n{output:?}"
+    );
+
+    let pushed_submodule_head = git::open(&submodule_origin_path)
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .id()
+        .detach();
+    assert_eq!(pushed_submodule_head, updated_submodule_head);
+    assert!(
+        git::open(&superproject_origin_path)
+            .try_find_reference("refs/heads/feature")
+            .unwrap()
+            .is_some()
+    );
+
+    // Pointing the gitlink back to a commit that is already on the submodule
+    // remote should not require guessing a branch to push from detached HEAD.
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-C",
+            "sub",
+            "checkout",
+            "--detach",
+            &initial_submodule_head.to_string(),
+        ])
+        .success();
+    work_dir.run_jj(["status"]).success();
+    work_dir
+        .run_jj(["describe", "-m", "point submodule at existing commit"])
+        .success();
+    work_dir
+        .run_jj(["bookmark", "create", "existing", "-r", "@"])
+        .success();
+    let output = work_dir
+        .run_jj(["git", "push", "--bookmark", "existing"])
+        .success();
+    assert!(!output.stderr.raw().contains("Pushed Git submodule sub."));
+    let unchanged_submodule_head = git::open(&submodule_origin_path)
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .id()
+        .detach();
+    assert_eq!(unchanged_submodule_head, updated_submodule_head);
+}
+
+#[test]
 fn test_git_push_default_remote_selection() {
     let test_env = TestEnvironment::default();
     set_up(&test_env);

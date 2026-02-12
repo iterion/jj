@@ -56,8 +56,14 @@ a comparison with Git, including how workflows are different, see the
   however.
 * **Bare repositories: Yes.** You can use `jj git init --git-repo=<path>` to
   create a repo backed by a bare Git repo.
-* **Submodules: No.** They will not show up in the working copy, but they will
-  not be lost either.
+* **Submodules: Partial.** Colocated Git-backed workspaces initialize and update
+  submodules when switching commits, recursively snapshot initialized nested
+  Jujutsu working-copy commits as ordinary gitlink changes, run commands in
+  those repositories with `jj sub`, and push changed submodule branches before
+  the superproject. Git-only submodules still snapshot their checked-out HEAD.
+  Adding submodules and advanced conflict/fetch workflows still use Git. See the
+  [submodule design and command
+  workflow](design/git-submodules.md#current-command-behavior).
 * **Partial clones: No.**
 * **Shallow clones: Kind of.** Shallow commits all have the virtual root commit
   as their parent. However, deepening or fully unshallowing a repository is

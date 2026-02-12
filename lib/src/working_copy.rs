@@ -27,6 +27,7 @@ use thiserror::Error;
 use tracing::instrument;
 
 use crate::backend::BackendError;
+use crate::backend::CommitId;
 use crate::commit::Commit;
 use crate::gitignore::GitIgnoreError;
 use crate::gitignore::GitIgnoreFile;
@@ -224,6 +225,14 @@ pub struct SnapshotOptions<'a> {
     /// (depending on implementation)
     /// return `SnapshotError::NewFileTooLarge`.
     pub max_new_file_size: u64,
+    /// Gitlink IDs supplied by a higher-level submodule workspace coordinator.
+    ///
+    /// A local-disk working copy normally snapshots the checked-out Git HEAD
+    /// for a tracked submodule. An entry in this map overrides that value. This
+    /// lets an initialized nested Jujutsu workspace expose its effective
+    /// working-copy commit to the superproject without coupling the filesystem
+    /// scanner to repository loading.
+    pub git_submodule_ids: Option<&'a BTreeMap<RepoPathBuf, CommitId>>,
 }
 
 /// A callback for getting progress updates.
