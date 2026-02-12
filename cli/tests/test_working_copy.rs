@@ -666,3 +666,99 @@ fn test_snapshot_jjconflict_trees() -> TestResult {
     ");
     Ok(())
 }
+
+#[test]
+fn test_colocated_checkout_updates_submodule_working_copy() {
+    let test_env = TestEnvironment::default();
+
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "submodule"])
+        .success();
+    let submodule_dir = test_env.work_dir("submodule");
+    submodule_dir.write_file("sub", "v1\n");
+    submodule_dir
+        .run_jj(["commit", "-m", "Submodule v1"])
+        .success();
+    submodule_dir.write_file("sub", "v2\n");
+    submodule_dir
+        .run_jj(["commit", "-m", "Submodule v2"])
+        .success();
+
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "repo"])
+        .success();
+    let work_dir = test_env.work_dir("repo");
+
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &format!("{}/submodule", test_env.env_root().display()),
+            "sub",
+        ])
+        .success();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-C",
+            "sub",
+            "config",
+            "protocol.file.allow",
+            "always",
+        ])
+        .success();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "Add submodule at v2",
+        ])
+        .success();
+
+    work_dir
+        .run_jj([
+            "util", "exec", "--", "git", "-C", "sub", "checkout", "HEAD~1",
+        ])
+        .success();
+    work_dir
+        .run_jj(["util", "exec", "--", "git", "add", "sub"])
+        .success();
+    work_dir
+        .run_jj([
+            "util",
+            "exec",
+            "--",
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test user",
+            "commit",
+            "-m",
+            "Update submodule to v1",
+        ])
+        .success();
+
+    work_dir.run_jj(["prev"]).success();
+    assert_eq!(work_dir.read_file("sub/sub"), "v2\n");
+
+    work_dir.run_jj(["next"]).success();
+    assert_eq!(work_dir.read_file("sub/sub"), "v1\n");
+}

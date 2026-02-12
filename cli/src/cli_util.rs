@@ -2286,6 +2286,15 @@ to the current parents may contain changes from multiple commits.
             new_commit,
         )
         .await?;
+        if self.working_copy_shared_with_git() {
+            maybe_update_submodules_in_colocated_git_workspace(
+                ui,
+                self.workspace_root(),
+                self.settings(),
+                new_commit,
+            )
+            .await?;
+        }
         self.print_updated_working_copy_stats(ui, maybe_old_commit, new_commit, &stats)
     }
 
@@ -3419,6 +3428,71 @@ pub async fn update_working_copy(
             )
         })?;
     Ok(stats)
+}
+
+async fn maybe_update_submodules_in_colocated_git_workspace(
+    ui: &Ui,
+    workspace_root: &Path,
+    settings: &UserSettings,
+    new_commit: &Commit,
+) -> Result<(), CommandError> {
+    if !commit_has_gitmodules_file(new_commit).await? {
+        return Ok(());
+    }
+
+    let git_executable: PathBuf = settings.get("git.executable-path")?;
+    let output = std::process::Command::new(&git_executable)
+        .current_dir(workspace_root)
+        .args(["submodule", "update", "--init", "--recursive"])
+        .output()
+        .map_err(|err| {
+            user_error_with_message(
+                "Failed to execute git submodule update while syncing the working copy",
+                err,
+            )
+        })?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    writeln!(
+        ui.warning_default(),
+        "Failed to update Git submodules to match the checked-out commit."
+    )?;
+    if let Some(code) = output.status.code() {
+        writeln!(
+            ui.warning_default(),
+            "`git submodule update` exited with status code {code}."
+        )?;
+    } else {
+        writeln!(
+            ui.warning_default(),
+            "`git submodule update` was terminated by signal."
+        )?;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        writeln!(ui.warning_default(), "{stderr}")?;
+    }
+    writeln!(
+        ui.hint_default(),
+        "Run `git submodule update --init --recursive` manually after resolving the issue."
+    )?;
+
+    Ok(())
+}
+
+async fn commit_has_gitmodules_file(commit: &Commit) -> Result<bool, CommandError> {
+    let gitmodules_path =
+        RepoPath::from_internal_string(".gitmodules").expect("valid static repo path");
+    let value = commit
+        .tree()
+        .path_value(gitmodules_path)
+        .await
+        .map_err(|err| internal_error_with_message("Failed to inspect .gitmodules", err))?;
+    Ok(matches!(value.as_normal(), Some(TreeValue::File { .. })))
 }
 
 /// Returns the special remote name that should be ignored by default.
